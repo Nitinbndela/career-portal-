@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
+    "fs-extra": "^11.1.1",
     "lodash": "^4.17.21",
+    "puppeteer": "^21.5.2",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-icons": "^4.10.1",
@@ -11,8 +13,10 @@
     "react-scripts": "5.0.1"
   },
   "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build"
+    "start": "node scripts/start-with-scraper.js",
+    "build": "react-scripts build",
+    "dev": "react-scripts start",
+    "scraper-only": "node scripts/scraper-only.js"
   },
   "browserslist": {
     "production": [
