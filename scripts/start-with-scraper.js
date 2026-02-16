@@ -48,20 +48,38 @@ if (isProductionBuild) {
     env: { ...process.env, PORT: process.env.PORT || 3000 },
   });
 
+  let scraperProcess = null;
+
   // Give React a moment to start, then initialize scraper as completely separate process
   setTimeout(() => {
     console.log("\n[LAUNCHER] Starting background scraper service...\n");
     
     // Spawn scraper as completely separate Node.js process
-    const scraperProcess = spawn("node", [path.join(__dirname, "scraper-only.js")], {
-      stdio: "inherit",
+    scraperProcess = spawn("node", [path.join(__dirname, "scraper-only.js")], {
+      stdio: ["ignore", "pipe", "pipe"], // Capture stdout and stderr
       shell: true,
       cwd: projectRoot,
-      detached: true,  // Allow scraper to run independently
+      detached: false,  // Keep attached so we can see output
     });
 
-    // Allow scraper process to run independently
-    scraperProcess.unref();
+    // Forward scraper output to console
+    scraperProcess.stdout.on("data", (data) => {
+      process.stdout.write(data);
+    });
+
+    scraperProcess.stderr.on("data", (data) => {
+      process.stderr.write(data);
+    });
+
+    scraperProcess.on("error", (err) => {
+      console.error("[LAUNCHER] Failed to start scraper:", err);
+    });
+
+    scraperProcess.on("exit", (code) => {
+      if (code !== 0 && code !== null) {
+        console.error(`[LAUNCHER] Scraper process exited with code ${code}`);
+      }
+    });
   }, 3000);
 
   reactServer.on("error", (err) => {
@@ -71,7 +89,10 @@ if (isProductionBuild) {
 
   process.on("SIGINT", () => {
     console.log("\n[LAUNCHER] Shutting down...");
-    reactServer.kill();
+    if (scraperProcess) {
+      scraperProcess.kill("SIGINT");
+    }
+    reactServer.kill("SIGINT");
     process.exit(0);
   });
 }

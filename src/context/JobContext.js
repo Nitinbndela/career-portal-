@@ -40,21 +40,60 @@ const determineCategory = (title) => {
   return 'job';
 };
 
+// Helper to process job data
+const processJobData = (data) => {
+  return Array.isArray(data) ? data.map(job => ({
+    ...job,
+    slug: job.slug || generateSlug(job.title),
+    category: job.category ? normalizeCategory(job.category) : determineCategory(job.title),
+    importantDates: job.importantDates || {},
+    applicationFee: job.applicationFee || {},
+    ageLimit: job.ageLimit || {},
+    vacancyDetails: job.vacancyDetails || [],
+    postedDate: job.postedDate || job.postDate || new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+  })) : [];
+};
+
 // Process the raw JSON data to ensure every job has a slug and necessary fields
-const processedData = Array.isArray(rawData) ? rawData.map(job => ({
-  ...job,
-  slug: job.slug || generateSlug(job.title),
-  category: job.category ? normalizeCategory(job.category) : determineCategory(job.title),
-  importantDates: job.importantDates || {},
-  applicationFee: job.applicationFee || {},
-  ageLimit: job.ageLimit || {},
-  vacancyDetails: job.vacancyDetails || [],
-  postedDate: job.postedDate || job.postDate || new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-})) : [];
+const processedData = processJobData(rawData);
 
 export const JobProvider = ({ children }) => {
   // Initialize state with processedData (Prioritize jobs.json to show new data)
   const [jobs, setJobs] = useState(processedData);
+  const [lastUpdate, setLastUpdate] = useState(Date.now());
+
+  // Load jobs.json dynamically to pick up scraper updates
+  const loadJobsFromFile = async () => {
+    try {
+      // Fetch from public folder (accessible at runtime)
+      const response = await fetch('/data/jobs.json?t=' + Date.now());
+      if (response.ok) {
+        const data = await response.json();
+        const processed = processJobData(data);
+        if (processed.length > 0 && processed.length !== jobs.length) {
+          setJobs(processed);
+          setLastUpdate(Date.now());
+          console.log(`[UI] Updated: Loaded ${processed.length} jobs from jobs.json`);
+        }
+      }
+    } catch (error) {
+      // Silently fail - will use static import as fallback
+      // console.log('[UI] Using static jobs data');
+    }
+  };
+
+  // Poll for updates every 30 seconds (scraper runs every 2 minutes)
+  useEffect(() => {
+    // Initial load attempt
+    loadJobsFromFile();
+
+    // Set up polling to check for updates
+    const interval = setInterval(() => {
+      loadJobsFromFile();
+    }, 30000); // Check every 30 seconds
+
+    return () => clearInterval(interval);
+  }, []);
 
   // 2. Save to LocalStorage whenever the jobs list changes
   useEffect(() => {

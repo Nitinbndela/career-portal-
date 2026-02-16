@@ -21,9 +21,12 @@ scraper.start().catch((error) => {
 // Handle graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\n[SCRAPER] Shutting down gracefully...");
-  scraper.isRunning = false;
-  if (scraper.browser) {
-    await scraper.browser.close();
-  }
+  await scraper.stop();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("\n[SCRAPER] Received SIGTERM, shutting down...");
+  await scraper.stop();
   process.exit(0);
 });

@@ -10,10 +10,11 @@ const path = require("path");
 const CONFIG = {
   baseUrl: "https://sarkariresult.com.im/",
   baseHost: "sarkariresult.com.im",
-  jobsFile: path.join(__dirname, "../data/jobs.json"),
+  jobsFile: path.join(__dirname, "../data/jobs.json"), // Keep in src/data for import
+  jobsFilePublic: path.join(__dirname, "../../public/data/jobs.json"), // Also copy to public for fetch
   concurrency: 2,
   timeout: 60000,
-  scrapeInterval: 2 * 60 * 1000, // 10 minutes
+  scrapeInterval: 2 * 60 * 1000, // 2 minutes (change to 10 * 60 * 1000 for 10 minutes)
   userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   maxQueueSize: 15000,
   maxJsonLines: 90000,
@@ -40,44 +41,98 @@ class BackgroundScraper {
   }
 
   async init() {
+    if (this.browser) {
+      return; // Already initialized
+    }
+
     console.log("[SCRAPER] Initializing Background Scraper Service...");
 
+    // Ensure data directory exists
+    const dataDir = path.dirname(CONFIG.jobsFile);
+    await fs.ensureDir(dataDir);
+
     try {
+      // Try to load from src/data first, then public/data
+      let existing = [];
       if (await fs.pathExists(CONFIG.jobsFile)) {
-        const existing = await fs.readJson(CONFIG.jobsFile);
+        existing = await fs.readJson(CONFIG.jobsFile);
+      } else if (await fs.pathExists(CONFIG.jobsFilePublic)) {
+        existing = await fs.readJson(CONFIG.jobsFilePublic);
+      }
+
+      if (Array.isArray(existing) && existing.length > 0) {
         existing.forEach((job) => {
-          if (job.officialLink) {
+          if (job && job.officialLink) {
             const norm = job.officialLink.split("#")[0].replace(/\/$/, "") || job.officialLink;
             this.jobsData.set(norm, job);
             this.visited.add(norm);
           }
         });
         console.log(`[SCRAPER] Loaded ${this.jobsData.size} existing jobs from cache.`);
+      } else {
+        console.log("[SCRAPER] No existing jobs file found. Starting fresh.");
+        // Initialize with empty array in both locations
+        await fs.ensureDir(path.dirname(CONFIG.jobsFile));
+        await fs.ensureDir(path.dirname(CONFIG.jobsFilePublic));
+        await fs.writeJson(CONFIG.jobsFile, [], { spaces: 2 });
+        await fs.writeJson(CONFIG.jobsFilePublic, [], { spaces: 2 });
       }
     } catch (e) {
+      console.log("[SCRAPER] Error loading existing data:", e.message);
       console.log("[SCRAPER] Starting with fresh database.");
+      // Initialize with empty array in both locations
+      await fs.ensureDir(path.dirname(CONFIG.jobsFile));
+      await fs.ensureDir(path.dirname(CONFIG.jobsFilePublic));
+      await fs.writeJson(CONFIG.jobsFile, [], { spaces: 2 });
+      await fs.writeJson(CONFIG.jobsFilePublic, [], { spaces: 2 });
     }
 
-    this.browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-accelerated-2d-canvas",
-        "--disable-gpu",
-        "--window-size=1920,1080",
-      ],
-      defaultViewport: null,
-    });
+    try {
+      this.browser = await puppeteer.launch({
+        headless: "new",
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-accelerated-2d-canvas",
+          "--disable-gpu",
+          "--window-size=1920,1080",
+        ],
+        defaultViewport: null,
+      });
+      console.log("[SCRAPER] Browser initialized successfully.");
+    } catch (error) {
+      console.error("[SCRAPER] Failed to launch browser:", error.message);
+      throw error;
+    }
   }
 
   async start() {
     await this.init();
     this.isRunning = true;
-    console.log("[SCRAPER] Starting comprehensive crawl cycle...\n");
+    console.log("[SCRAPER] Background scraper service started successfully!");
+    console.log(`[SCRAPER] Scraping interval: ${CONFIG.scrapeInterval / 60000} minutes\n`);
 
-    while (this.queue.size > 0 && this.isRunning) {
+    // Run first cycle immediately
+    await this.runCycle();
+
+    // Then schedule periodic cycles
+    this.scheduleNextCycle();
+  }
+
+  async runCycle() {
+    if (!this.isRunning) return;
+
+    // Reset queue for new cycle (add baseUrl if queue is empty)
+    if (this.queue.size === 0) {
+      this.queue.add(CONFIG.baseUrl);
+      console.log("[SCRAPER] Starting new crawl cycle...\n");
+    }
+
+    let cycleCount = 0;
+    const maxCycles = 1000; // Safety limit to prevent infinite loops
+
+    while (this.queue.size > 0 && this.isRunning && cycleCount < maxCycles) {
       const batch = Array.from(this.queue).slice(0, CONFIG.concurrency);
       batch.forEach((url) => {
         this.queue.delete(url);
@@ -86,24 +141,53 @@ class BackgroundScraper {
 
       if (batch.length === 0) break;
 
-      console.log(`[SCRAPER] Batch: ${batch.length} | Queue: ${this.queue.size} | Visited: ${this.visited.size}`);
+      cycleCount++;
+      console.log(`[SCRAPER] Batch ${cycleCount}: ${batch.length} URLs | Queue: ${this.queue.size} | Visited: ${this.visited.size} | Jobs: ${this.jobsData.size}`);
 
-      await Promise.all(batch.map((url) => this.processUrl(url)));
-      await this.saveData();
+      try {
+        await Promise.all(batch.map((url) => this.processUrl(url)));
+        await this.saveData();
+        console.log(`[SCRAPER] Batch ${cycleCount} completed. Data saved.\n`);
+      } catch (error) {
+        console.error(`[SCRAPER] Error in batch ${cycleCount}:`, error.message);
+      }
     }
 
-    console.log("[SCRAPER] Crawl cycle complete.");
+    console.log(`[SCRAPER] Crawl cycle complete. Total jobs scraped: ${this.jobsData.size}`);
     await this.saveData();
-    await this.browser.close();
+    console.log(`[SCRAPER] Data saved to ${CONFIG.jobsFile}\n`);
+  }
 
-    console.log(`[SCRAPER] Next update in ${CONFIG.scrapeInterval / 60000} minutes...`);
-    // Schedule next cycle
-    setTimeout(() => new BackgroundScraper().start(), CONFIG.scrapeInterval);
+  scheduleNextCycle() {
+    if (!this.isRunning) return;
+
+    console.log(`[SCRAPER] Next cycle scheduled in ${CONFIG.scrapeInterval / 60000} minutes...\n`);
+    setTimeout(async () => {
+      if (this.isRunning) {
+        await this.runCycle();
+        this.scheduleNextCycle(); // Schedule the next cycle
+      }
+    }, CONFIG.scrapeInterval);
+  }
+
+  async stop() {
+    console.log("[SCRAPER] Stopping scraper...");
+    this.isRunning = false;
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+    }
+    console.log("[SCRAPER] Scraper stopped.");
   }
 
   async processUrl(url) {
     let page = null;
     try {
+      if (!this.browser) {
+        console.error("[SCRAPER] Browser not initialized, reinitializing...");
+        await this.init();
+      }
+
       page = await this.browser.newPage();
 
       await page.setRequestInterception(true);
@@ -148,18 +232,27 @@ class BackgroundScraper {
       if (isCategoryPage(url)) return;
 
       const isJob = await this.isJobPage(page);
-      if (isJob && !this.jobsData.has(url)) {
-        const scrapedAt = new Date().toISOString();
-        const jobData = await this.scrapeJobDetails(page, url, scrapedAt);
-        if (jobData && jobData.title) {
-          this.jobsData.set(url, jobData);
-          console.log(`  [✓] ${jobData.title.substring(0, 55)}...`);
+      if (isJob) {
+        const normalizedUrl = url.split("#")[0].replace(/\/$/, "") || url;
+        if (!this.jobsData.has(normalizedUrl)) {
+          const scrapedAt = new Date().toISOString();
+          const jobData = await this.scrapeJobDetails(page, url, scrapedAt);
+          if (jobData && jobData.title) {
+            this.jobsData.set(normalizedUrl, jobData);
+            console.log(`  [✓] Scraped: ${jobData.title.substring(0, 55)}...`);
+          }
         }
       }
     } catch (err) {
-      // Silent fail for individual URLs
+      console.error(`[SCRAPER] Error processing ${url}:`, err.message);
     } finally {
-      if (page) await page.close();
+      if (page) {
+        try {
+          await page.close();
+        } catch (e) {
+          // Ignore page close errors
+        }
+      }
     }
   }
 
@@ -237,8 +330,150 @@ class BackgroundScraper {
         return $$("li", ulOrOl).map((li) => clean(li.innerText)).filter((t) => t.length > 1);
       };
 
-      // Find sections by header proximity
-      const sectionHeaders = ["important dates", "application fee", "exam fee", "age limit", "selection process", "how to apply", "how to"];
+      // Get all tables for extraction
+      const tables = $$("table");
+
+      // --- EXTRACT IMPORTANT DATES TABLE ---
+      let datesTable = null;
+      for (const table of tables) {
+        const tableText = table.innerText.toLowerCase();
+        if (tableText.includes("important date") || tableText.includes("important dates") || 
+            tableText.includes("application start") || tableText.includes("last date") ||
+            tableText.includes("exam date") || tableText.includes("admit card date")) {
+          datesTable = table;
+          break;
+        }
+      }
+
+      if (datesTable) {
+        const dateRows = Array.from(datesTable.querySelectorAll("tr"));
+        dateRows.forEach(row => {
+          const cols = row.querySelectorAll("td, th");
+          if (cols.length >= 2) {
+            const label = clean(cols[0].innerText).toLowerCase();
+            const value = clean(cols[1].innerText);
+            
+            if (value && value.length > 0) {
+              // Map common date labels to structured fields
+              if (label.includes("application start") || label.includes("online registration start") || label.includes("apply start")) {
+                job.importantDates.applicationStart = value;
+              } else if (label.includes("application end") || label.includes("last date") || label.includes("apply end") || label.includes("closing date")) {
+                job.importantDates.applicationEnd = value;
+              } else if (label.includes("exam date") || label.includes("examination date") || label.includes("test date")) {
+                job.importantDates.examDate = value;
+              } else if (label.includes("admit card") || label.includes("hall ticket")) {
+                job.importantDates.admitCardDate = value;
+              } else if (label.includes("result") || label.includes("result date")) {
+                job.importantDates.resultDate = value;
+              } else if (label.includes("answer key") || label.includes("answer key date")) {
+                job.importantDates.answerKeyDate = value;
+              } else {
+                // Store any other dates in a generic format
+                job.importantDates[label] = value;
+              }
+            }
+          }
+        });
+      }
+
+      // --- EXTRACT APPLICATION FEE TABLE ---
+      let feeTable = null;
+      for (const table of tables) {
+        const tableText = table.innerText.toLowerCase();
+        if (tableText.includes("application fee") || tableText.includes("exam fee") || 
+            tableText.includes("fee") && (tableText.includes("general") || tableText.includes("obc") || tableText.includes("sc") || tableText.includes("st"))) {
+          feeTable = table;
+          break;
+        }
+      }
+
+      if (feeTable) {
+        const feeRows = Array.from(feeTable.querySelectorAll("tr"));
+        feeRows.forEach(row => {
+          const cols = row.querySelectorAll("td, th");
+          if (cols.length >= 2) {
+            const label = clean(cols[0].innerText).toLowerCase();
+            const value = clean(cols[1].innerText);
+            
+            if (value && value.length > 0) {
+              // Extract fee by category
+              if (label.includes("general") || label.includes("ur") || label.includes("unreserved")) {
+                job.applicationFee.general = value;
+              } else if (label.includes("obc")) {
+                job.applicationFee.obc = value;
+              } else if (label.includes("sc")) {
+                job.applicationFee.sc = value;
+              } else if (label.includes("st")) {
+                job.applicationFee.st = value;
+              } else if (label.includes("ews")) {
+                job.applicationFee.ews = value;
+              } else if (label.includes("ph") || label.includes("pwd") || label.includes("disabled")) {
+                job.applicationFee.ph = value;
+              } else if (label.includes("fee") || label.includes("amount")) {
+                job.applicationFee.other = value;
+              }
+            }
+          }
+        });
+        
+        // Also extract fee bullets if present
+        const feeBullets = [];
+        feeRows.forEach(row => {
+          const text = clean(row.innerText);
+          if (text && text.length > 5 && (text.includes("fee") || text.includes("rs") || text.includes("rupee"))) {
+            feeBullets.push(text);
+          }
+        });
+        if (feeBullets.length > 0) {
+          job.applicationFeeBullets = feeBullets;
+        }
+      }
+
+      // --- EXTRACT AGE LIMIT TABLE ---
+      let ageTable = null;
+      for (const table of tables) {
+        const tableText = table.innerText.toLowerCase();
+        if (tableText.includes("age limit") || tableText.includes("age") && (tableText.includes("minimum") || tableText.includes("maximum") || tableText.includes("year"))) {
+          ageTable = table;
+          break;
+        }
+      }
+
+      if (ageTable) {
+        const ageRows = Array.from(ageTable.querySelectorAll("tr"));
+        ageRows.forEach(row => {
+          const cols = row.querySelectorAll("td, th");
+          if (cols.length >= 2) {
+            const label = clean(cols[0].innerText).toLowerCase();
+            const value = clean(cols[1].innerText);
+            
+            if (value && value.length > 0) {
+              if (label.includes("minimum") || label.includes("min")) {
+                job.ageLimit.minimum = value;
+              } else if (label.includes("maximum") || label.includes("max")) {
+                job.ageLimit.maximum = value;
+              } else if (label.includes("age") && !label.includes("relaxation")) {
+                job.ageLimit.general = value;
+              }
+            }
+          }
+        });
+        
+        // Also extract age limit bullets if present
+        const ageBullets = [];
+        ageRows.forEach(row => {
+          const text = clean(row.innerText);
+          if (text && text.length > 5 && (text.includes("age") || text.includes("year"))) {
+            ageBullets.push(text);
+          }
+        });
+        if (ageBullets.length > 0) {
+          job.ageLimitBullets = ageBullets;
+        }
+      }
+
+      // Find sections by header proximity (for other sections)
+      const sectionHeaders = ["selection process", "how to apply", "how to"];
 
       const allSections = [];
       $$("h2, h3, h4, strong, b").forEach((el) => {
@@ -266,6 +501,15 @@ class BackgroundScraper {
           });
 
           allSections.push({ name: match, bullets });
+        }
+      });
+
+      // Process extracted sections
+      allSections.forEach(section => {
+        if (section.name === "selection process" && section.bullets.length > 0) {
+          job.selectionProcess = section.bullets;
+        } else if (section.name.includes("how to apply") && section.bullets.length > 0) {
+          job.howToApply = section.bullets;
         }
       });
 
@@ -305,7 +549,6 @@ class BackgroundScraper {
 
       // --- IMPORTANT LINKS TABLE ---
       let linksTable = null;
-      const tables = $$("table");
       
       // Strategy 1: Iterate through tables and find one containing "important link"
       for (const table of tables) {
@@ -380,48 +623,93 @@ class BackgroundScraper {
            });
       }
 
-      // Clean redundant empty arrays
-      if (job.applicationFeeBullets.length === 0) delete job.applicationFeeBullets;
-      if (job.ageLimitBullets.length === 0) delete job.ageLimitBullets;
-      if (job.selectionProcess.length === 0) delete job.selectionProcess;
-      if (job.howToApply.length === 0) delete job.howToApply;
-      if (job.salary.length === 0) delete job.salary;
-      if (job.faqs.length === 0) delete job.faqs;
+      // Clean redundant empty arrays and objects
+      if (job.applicationFeeBullets && job.applicationFeeBullets.length === 0) delete job.applicationFeeBullets;
+      if (job.ageLimitBullets && job.ageLimitBullets.length === 0) delete job.ageLimitBullets;
+      if (job.selectionProcess && job.selectionProcess.length === 0) delete job.selectionProcess;
+      if (job.howToApply && job.howToApply.length === 0) delete job.howToApply;
+      if (job.salary && job.salary.length === 0) delete job.salary;
+      if (job.faqs && job.faqs.length === 0) delete job.faqs;
       if (job.rawBulletSections && Object.keys(job.rawBulletSections).length === 0) delete job.rawBulletSections;
+      if (job.importantDates && Object.keys(job.importantDates).length === 0) delete job.importantDates;
+      if (job.applicationFee && Object.keys(job.applicationFee).length === 0) delete job.applicationFee;
+      if (job.ageLimit && Object.keys(job.ageLimit).length === 0) delete job.ageLimit;
 
       return job;
     }, url, scrapedAt, CONFIG.baseUrl);
   }
 
   async saveData() {
-    let data = Array.from(this.jobsData.values());
-    // Sort by scrapedAt (oldest first)
-    data.sort((a, b) => {
-      const da = a.scrapedAt || "";
-      const db = b.scrapedAt || "";
-      return da.localeCompare(db);
-    });
-    // Trim to max lines by removing oldest jobs first
-    while (data.length > 0) {
-      const str = JSON.stringify(data, null, 2);
-      const lineCount = str.split("\n").length;
-      if (lineCount <= CONFIG.maxJsonLines) break;
-      const removed = data.shift();
-      if (removed && removed.officialLink) this.jobsData.delete(removed.officialLink);
+    try {
+      let data = Array.from(this.jobsData.values());
+      
+      // Ensure we have valid data
+      if (!Array.isArray(data)) {
+        data = [];
+      }
+
+      // Sort by scrapedAt (oldest first)
+      data.sort((a, b) => {
+        const da = a?.scrapedAt || "";
+        const db = b?.scrapedAt || "";
+        return da.localeCompare(db);
+      });
+
+      // Trim to max lines by removing oldest jobs first
+      while (data.length > 0) {
+        const str = JSON.stringify(data, null, 2);
+        const lineCount = str.split("\n").length;
+        if (lineCount <= CONFIG.maxJsonLines) break;
+        const removed = data.shift();
+        if (removed && removed.officialLink) {
+          const norm = removed.officialLink.split("#")[0].replace(/\/$/, "") || removed.officialLink;
+          this.jobsData.delete(norm);
+        }
+      }
+
+      // Ensure directories exist
+      const dataDir = path.dirname(CONFIG.jobsFile);
+      await fs.ensureDir(dataDir);
+      const publicDataDir = path.dirname(CONFIG.jobsFilePublic);
+      await fs.ensureDir(publicDataDir);
+
+      // Save data to both locations
+      await fs.writeJson(CONFIG.jobsFile, data, { spaces: 2 });
+      await fs.writeJson(CONFIG.jobsFilePublic, data, { spaces: 2 });
+      console.log(`[SCRAPER] Saved ${data.length} jobs to ${CONFIG.jobsFile} and ${CONFIG.jobsFilePublic}`);
+    } catch (error) {
+      console.error("[SCRAPER] Error saving data:", error.message);
+      throw error;
     }
-    await fs.writeJson(CONFIG.jobsFile, data, { spaces: 2 });
   }
 }
 
 // Export for use in the app
+let scraperInstance = null;
+
 module.exports = {
   BackgroundScraper,
   startScraper: async () => {
     console.log("[SCRAPER] Background scraper service starting...");
     try {
-      new BackgroundScraper().start();
+      if (!scraperInstance) {
+        scraperInstance = new BackgroundScraper();
+        scraperInstance.start().catch((error) => {
+          console.error("[SCRAPER] Fatal error in scraper:", error);
+          scraperInstance = null;
+        });
+      } else {
+        console.log("[SCRAPER] Scraper already running.");
+      }
     } catch (error) {
       console.error("[SCRAPER] Error starting scraper:", error.message);
+      scraperInstance = null;
+    }
+  },
+  stopScraper: async () => {
+    if (scraperInstance) {
+      await scraperInstance.stop();
+      scraperInstance = null;
     }
   },
 };
